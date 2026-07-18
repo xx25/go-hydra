@@ -19,7 +19,8 @@ import (
 // the caller is done; Abort tears down mid-batch.
 type Session struct {
 	config    *Config
-	handler   FileHandler
+	send      SendHandler
+	recv      RecvHandler
 	dev       DeviceHandler
 	transport io.ReadWriter
 	closer    io.Closer
@@ -135,17 +136,29 @@ func (in *pktInbox) tryPop() (packet, bool) {
 	return p, true
 }
 
-// NewSession constructs a Session. dev may be nil — incoming DEVDATA is
-// then acknowledged and dropped. cfg may be nil for defaults.
+// NewSession constructs a Session. Either handler may be nil: a nil
+// send means the local TX batch is immediately empty (end-of-batch
+// FINFO right after negotiation); a nil recv defers every incoming file
+// with FINFOACK(-2), so a receive-less side never marks peer files
+// delivered. One object implementing both interfaces may be passed as
+// both arguments. dev may be nil — incoming DEVDATA is then
+// acknowledged and dropped. cfg may be nil for defaults.
 //
 // The transport must be closable: either it implements io.Closer or
 // cfg.Closer is set; Run refuses to start otherwise. It is closed on
 // error, on Abort, and by Close — but NOT after a clean batch, so
 // another Run (next batch) can follow.
-func NewSession(transport io.ReadWriter, handler FileHandler, dev DeviceHandler, cfg *Config) *Session {
+func NewSession(transport io.ReadWriter, send SendHandler, recv RecvHandler, dev DeviceHandler, cfg *Config) *Session {
+	if send == nil {
+		send = noSend{}
+	}
+	if recv == nil {
+		recv = noRecv{}
+	}
 	return &Session{
 		config:    cfg.defaults(),
-		handler:   handler,
+		send:      send,
+		recv:      recv,
 		dev:       dev,
 		transport: transport,
 		inbox:     newPktInbox(),
@@ -172,9 +185,6 @@ func (s *Session) Run(ctx context.Context) error {
 	}
 	defer s.runActive.Store(false)
 
-	if s.handler == nil {
-		return errors.New("hydra: nil FileHandler")
-	}
 	if s.config.Closer != nil {
 		s.closer = s.config.Closer
 	} else if cl, ok := s.transport.(io.Closer); ok {
@@ -483,7 +493,27 @@ func newBatch(s *Session) *batch {
 // write sends one packet with the current effective options and peer
 // prefix.
 func (b *batch) write(typ byte, payload []byte) error {
+	b.logPkt("tx", typ, payload)
 	return b.s.writer.writePacket(typ, payload, b.opts, b.prefix)
+}
+
+// logPkt emits the per-packet Debug record on Config.Logger. The four
+// offset-bearing BIN types get their leading 4-byte LE offset decoded so
+// the trace correlates with file positions.
+func (b *batch) logPkt(dir string, typ byte, payload []byte) {
+	lg := b.cfg.Logger
+	if lg == nil {
+		return
+	}
+	switch typ {
+	case pktDATA, pktDATAACK, pktFINFOACK, pktEOF:
+		if off, err := parseOffset(payload); err == nil {
+			lg.Debug("hydra packet", "dir", dir, "type", string(typ),
+				"len", len(payload), "offset", off)
+			return
+		}
+	}
+	lg.Debug("hydra packet", "dir", dir, "type", string(typ), "len", len(payload))
 }
 
 func (b *batch) feedBraindead() {
@@ -558,7 +588,8 @@ func (b *batch) teardown(err error) {
 	}
 	b.rxCloseFile(err)
 	if b.txOffer != nil {
-		b.s.handler.FileCompleted(b.txInfo, b.txPos, err)
+		closeOffer(b.txOffer)
+		b.s.send.FileCompleted(b.txInfo, b.txPos, err)
 		b.txOffer = nil
 	}
 }
@@ -689,6 +720,7 @@ func (b *batch) fireTimers(now time.Time) (bool, error) {
 // handlePacket is the central dispatch (the C pkttype switch).
 func (b *batch) handlePacket(pkt packet) error {
 	b.trace("pkt %c len=%d", pkt.typ, len(pkt.payload))
+	b.logPkt("rx", pkt.typ, pkt.payload)
 	switch pkt.typ {
 	case pktSTART:
 		if b.txState == htxStart || b.txState == htxSwait {

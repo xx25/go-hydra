@@ -5,9 +5,10 @@ Pure Go implementation of the HYDRA bidirectional file transfer protocol
 qico, BinkleyTerm, Argus, Taurus.
 
 This is a library package — there is no CLI. Users import the `hydra`
-package, provide a `FileHandler`, and drive sessions over any
-`io.ReadWriter` transport (TCP sockets, serial ports, PTYs). Zero
-dependencies outside the Go standard library.
+package, provide a `SendHandler` and/or `RecvHandler` (one object may
+implement both), and drive sessions over any `io.ReadWriter` transport
+(TCP sockets, serial ports, PTYs). Zero dependencies outside the Go
+standard library.
 
 ## Features
 
@@ -44,7 +45,10 @@ import (
 	"github.com/xx25/go-hydra"
 )
 
-// handler implements hydra.FileHandler for both directions.
+// handler implements hydra.SendHandler and hydra.RecvHandler; both
+// directions run concurrently through it. Pass nil for a direction you
+// don't use: nil send = empty TX batch, nil recv = every incoming file
+// deferred with FINFOACK(-2).
 type handler struct {
 	outbound []*hydra.FileOffer
 }
@@ -83,10 +87,11 @@ func main() {
 		Name:    fi.Name(),
 		Size:    fi.Size(),
 		ModTime: fi.ModTime(),
-		Reader:  f, // io.ReadSeeker enables resume and RPOS
+		Reader:  f,       // io.ReadSeeker enables resume and RPOS
+		Close:   f.Close, // fired exactly once when the file finishes
 	}}}
 
-	sess := hydra.NewSession(conn, h, nil, &hydra.Config{
+	sess := hydra.NewSession(conn, h, h, nil, &hydra.Config{
 		Originator: true,
 	})
 	defer sess.Close()

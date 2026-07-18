@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -17,7 +18,8 @@ type testFile struct {
 	data []byte
 }
 
-// testHandler implements FileHandler for both sides of a loopback session.
+// testHandler implements SendHandler + RecvHandler for both sides of a
+// loopback session.
 type testHandler struct {
 	mu sync.Mutex
 
@@ -126,8 +128,9 @@ func testConfig(orig bool) *Config {
 	}
 }
 
-// runLoopback drives one batch on both ends of an in-memory pipe.
-func runLoopback(t *testing.T, hA, hB FileHandler, devA, devB DeviceHandler, cfgA, cfgB *Config) (*Session, *Session, error, error) {
+// runLoopback drives one batch on both ends of an in-memory pipe. The
+// symmetric testHandler serves as both directions' handler.
+func runLoopback(t *testing.T, hA, hB *testHandler, devA, devB DeviceHandler, cfgA, cfgB *Config) (*Session, *Session, error, error) {
 	t.Helper()
 	connA, connB := net.Pipe()
 	if cfgA == nil {
@@ -136,8 +139,8 @@ func runLoopback(t *testing.T, hA, hB FileHandler, devA, devB DeviceHandler, cfg
 	if cfgB == nil {
 		cfgB = testConfig(false)
 	}
-	sa := NewSession(connA, hA, devA, cfgA)
-	sb := NewSession(connB, hB, devB, cfgB)
+	sa := NewSession(connA, hA, hA, devA, cfgA)
+	sb := NewSession(connB, hB, hB, devB, cfgB)
 	errA, errB := runBoth(t, sa, sb)
 	return sa, sb, errA, errB
 }
@@ -352,8 +355,8 @@ func TestLoopbackDeviceChannel(t *testing.T) {
 	hB := newTestHandler(nil)
 	devB := &recordingDev{}
 	connA, connB := net.Pipe()
-	sa := NewSession(connA, hA, nil, testConfig(true))
-	sb := NewSession(connB, hB, devB, testConfig(false))
+	sa := NewSession(connA, hA, hA, nil, testConfig(true))
+	sb := NewSession(connB, hB, hB, devB, testConfig(false))
 	defer sa.Close()
 	defer sb.Close()
 
@@ -371,6 +374,112 @@ func TestLoopbackDeviceChannel(t *testing.T) {
 	}
 }
 
+// A nil SendHandler is an immediately-empty TX batch; a nil RecvHandler
+// defers every offer with FINFOACK(-2). Both at once must still
+// complete a clean batch, and the offering side must see ErrDefer (its
+// files stay queued — the non-destructive refusal).
+func TestLoopbackNilHandlers(t *testing.T) {
+	files := []testFile{{"undeliverable.dat", randBytes(t, 3000)}}
+	hA := newTestHandler(files)
+	connA, connB := net.Pipe()
+	sa := NewSession(connA, hA, nil, nil, testConfig(true))
+	sb := NewSession(connB, nil, nil, nil, testConfig(false))
+	defer sa.Close()
+	defer sb.Close()
+	if errA, errB := runBoth(t, sa, sb); errA != nil || errB != nil {
+		t.Fatalf("session errors: A=%v B=%v", errA, errB)
+	}
+	done, errs := hA.completions()
+	if len(done) != 1 || done[0].Name != "undeliverable.dat" {
+		t.Fatalf("completions = %v, want exactly undeliverable.dat", done)
+	}
+	if !errors.Is(errs[0], ErrDefer) {
+		t.Errorf("nil-recv peer outcome = %v, want ErrDefer", errs[0])
+	}
+}
+
+// closeCounter wraps an offer's Close hook and counts invocations.
+type closeCounter struct{ n atomic.Int32 }
+
+func (c *closeCounter) hook() func() error {
+	return func() error { c.n.Add(1); return nil }
+}
+
+// FileOffer.Close must fire exactly once per offered file, on every
+// outcome: transferred, skipped by the peer, deferred by the peer.
+func TestLoopbackOfferCloseOutcomes(t *testing.T) {
+	files := []testFile{
+		{"sent.dat", randBytes(t, 2000)},
+		{"skipme.dat", randBytes(t, 2000)},
+		{"deferme.dat", randBytes(t, 2000)},
+	}
+	hA, hB := newTestHandler(files), newTestHandler(nil)
+	hB.skip["skipme.dat"] = true
+	hB.deferFiles["deferme.dat"] = true
+	counters := make(map[string]*closeCounter)
+	for _, o := range hA.pending {
+		c := &closeCounter{}
+		counters[o.Name] = c
+		o.Close = c.hook()
+	}
+	sa, sb, errA, errB := runLoopback(t, hA, hB, nil, nil, nil, nil)
+	defer sa.Close()
+	defer sb.Close()
+	if errA != nil || errB != nil {
+		t.Fatalf("session errors: A=%v B=%v", errA, errB)
+	}
+	for name, c := range counters {
+		if got := c.n.Load(); got != 1 {
+			t.Errorf("%s: Close fired %d times, want 1", name, got)
+		}
+	}
+}
+
+// FileOffer.Close must also fire exactly once when the batch tears down
+// with the file still in flight.
+func TestLoopbackOfferCloseOnTeardown(t *testing.T) {
+	hA := newTestHandler([]testFile{{"inflight.dat", randBytes(t, 500000)}})
+	c := &closeCounter{}
+	hA.pending[0].Close = c.hook()
+	hB := newTestHandler(nil)
+	connA, connB := net.Pipe()
+	sa := NewSession(connA, hA, hA, nil, testConfig(true))
+	sb := NewSession(connB, hB, hB, nil, testConfig(false))
+	defer sa.Close()
+	defer sb.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var errA, errB error
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	go func() { defer wg.Done(); errA = sa.Run(ctx) }()
+	go func() { defer wg.Done(); errB = sb.Run(ctx) }()
+	// Kill the receiving side once the transfer is under way.
+	for {
+		hA.mu.Lock()
+		started := len(hA.pending) == 0
+		hA.mu.Unlock()
+		if started {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	_ = sb.Abort()
+	wg.Wait()
+	if errA == nil && errB == nil {
+		t.Fatal("expected at least one side to error after Abort")
+	}
+	if got := c.n.Load(); got != 1 {
+		t.Errorf("Close fired %d times on teardown, want 1", got)
+	}
+	done, _ := hA.completions()
+	if len(done) != 1 {
+		t.Errorf("completions = %d, want exactly 1 for the in-flight file", len(done))
+	}
+}
+
 // bforce runs two batches per connection; Run must be callable again
 // after a clean batch on the same transport.
 func TestLoopbackSecondBatch(t *testing.T) {
@@ -378,8 +487,8 @@ func TestLoopbackSecondBatch(t *testing.T) {
 	second := []testFile{{"batch2.dat", randBytes(t, 7000)}}
 	hA, hB := newTestHandler(first), newTestHandler(nil)
 	connA, connB := net.Pipe()
-	sa := NewSession(connA, hA, nil, testConfig(true))
-	sb := NewSession(connB, hB, nil, testConfig(false))
+	sa := NewSession(connA, hA, hA, nil, testConfig(true))
+	sb := NewSession(connB, hB, hB, nil, testConfig(false))
 	defer sa.Close()
 	defer sb.Close()
 

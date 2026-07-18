@@ -81,17 +81,19 @@ func (b *batch) sendInit() error {
 func (b *batch) sendFinfo() error {
 	if b.lastFinfo == nil {
 		for b.txOffer == nil && !b.batchEnded {
-			offer := b.s.handler.NextFile()
+			offer := b.s.send.NextFile()
 			if offer == nil {
 				b.batchEnded = true
 				break
 			}
 			if offer.Size < 0 || offer.Size > SafeMaxOffset {
-				b.s.handler.FileCompleted(offerInfo(offer), 0, ErrFileTooLarge)
+				closeOffer(offer)
+				b.s.send.FileCompleted(offerInfo(offer), 0, ErrFileTooLarge)
 				continue
 			}
 			if offer.Reader == nil {
-				b.s.handler.FileCompleted(offerInfo(offer), 0, ErrHandlerContract)
+				closeOffer(offer)
+				b.s.send.FileCompleted(offerInfo(offer), 0, ErrHandlerContract)
 				continue
 			}
 			b.txOffer = offer
@@ -138,6 +140,19 @@ func offerInfo(o *FileOffer) FileInfo {
 	}
 }
 
+// closeOffer runs the offer's Close hook exactly once, nilling it so
+// the belt in finishTxFile and the teardown path cannot double-fire.
+// Runs before the matching FileCompleted so the handler observes the
+// file already released.
+func closeOffer(o *FileOffer) {
+	if o == nil || o.Close == nil {
+		return
+	}
+	c := o.Close
+	o.Close = nil
+	_ = c()
+}
+
 // sendData transmits one DATA block (HTX_XDATA, hydra.c:1249-1290).
 func (b *batch) sendData() error {
 	if b.txSkip {
@@ -179,7 +194,7 @@ func (b *batch) sendData() error {
 	}
 	b.txPos += int64(n)
 	b.blk.good(n)
-	b.s.handler.FileProgress(b.txInfo, b.txPos)
+	b.s.send.FileProgress(b.txInfo, b.txPos)
 
 	if b.txWindow > 0 && b.txPos >= b.txLastAck+b.txWindow {
 		b.armTx()
@@ -254,16 +269,19 @@ func (b *batch) txFinfoAck(pkt packet) error {
 		// Receiver already has the file. The wire treats this as a
 		// delivered outcome; ErrSkip lets the application distinguish
 		// it from an actual transfer (go-zmodem semantics).
-		b.s.handler.FileCompleted(b.txInfo, 0, ErrSkip)
+		closeOffer(b.txOffer)
+		b.s.send.FileCompleted(b.txInfo, 0, ErrSkip)
 		b.finishTxFile()
 	default: // ≤ -2: defer to a later batch
-		b.s.handler.FileCompleted(b.txInfo, 0, ErrDefer)
+		closeOffer(b.txOffer)
+		b.s.send.FileCompleted(b.txInfo, 0, ErrDefer)
 		b.finishTxFile()
 	}
 	return nil
 }
 
 func (b *batch) finishTxFile() {
+	closeOffer(b.txOffer)
 	b.txOffer = nil
 	b.txReader = nil
 	b.txSeeker = nil
@@ -370,14 +388,15 @@ func (b *batch) txEOFAck() {
 	}
 	b.eofAckWait = false
 	b.feedBraindead()
+	closeOffer(b.txOffer)
 	if b.txSkip {
 		err := b.txErr
 		if err == nil {
 			err = ErrSkip
 		}
-		b.s.handler.FileCompleted(b.txInfo, b.txPos, err)
+		b.s.send.FileCompleted(b.txInfo, b.txPos, err)
 	} else {
-		b.s.handler.FileCompleted(b.txInfo, b.txPos, nil)
+		b.s.send.FileCompleted(b.txInfo, b.txPos, nil)
 	}
 	b.finishTxFile()
 }

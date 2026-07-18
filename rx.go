@@ -148,30 +148,30 @@ func (b *batch) acceptFinfo(payload []byte) int32 {
 	// 32-bit offsets would collide with the -1/-2 sentinels); refuse
 	// before involving the handler, mirroring the TX-side check.
 	if info.Size > SafeMaxOffset {
-		b.s.handler.FileCompleted(info, 0, ErrFileTooLarge)
+		b.s.recv.FileCompleted(info, 0, ErrFileTooLarge)
 		return ackDefer
 	}
 
-	w, offset, herr := b.s.handler.AcceptFile(info)
+	w, offset, herr := b.s.recv.AcceptFile(info)
 	switch {
 	case errors.Is(herr, ErrSkip):
 		if w != nil {
 			_ = w.Close()
 		}
-		b.s.handler.FileCompleted(info, 0, herr)
+		b.s.recv.FileCompleted(info, 0, herr)
 		return ackHaveFile
 	case herr != nil:
 		if w != nil {
 			_ = w.Close()
 		}
-		b.s.handler.FileCompleted(info, 0, herr)
+		b.s.recv.FileCompleted(info, 0, herr)
 		return ackDefer
 	case w == nil:
-		b.s.handler.FileCompleted(info, 0, ErrHandlerContract)
+		b.s.recv.FileCompleted(info, 0, ErrHandlerContract)
 		return ackDefer
 	case offset < 0 || offset > SafeMaxOffset || (meta.size > 0 && offset > meta.size):
 		_ = w.Close()
-		b.s.handler.FileCompleted(info, 0, ErrResumeOutOfRange)
+		b.s.recv.FileCompleted(info, 0, ErrResumeOutOfRange)
 		return ackDefer
 	}
 
@@ -199,7 +199,7 @@ func (b *batch) rxCloseFile(err error) {
 		_ = b.rxWriter.Close()
 		b.rxWriter = nil
 	}
-	b.s.handler.FileCompleted(b.rxInfo, max(b.rxPos, 0), err)
+	b.s.recv.FileCompleted(b.rxInfo, max(b.rxPos, 0), err)
 }
 
 // rxData processes a DATA packet (hydra.c:1615-1690). Only meaningful in
@@ -249,7 +249,7 @@ func (b *batch) rxData(pkt packet) error {
 			offset: -2, blocksize: 0, id: b.rxSyncID,
 		}))
 	}
-	b.s.handler.FileProgress(b.rxInfo, b.rxPos)
+	b.s.recv.FileProgress(b.rxInfo, b.rxPos)
 	if b.rxWindow > 0 {
 		return b.write(pktDATAACK, marshalOffset(int32(b.rxPos)))
 	}

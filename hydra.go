@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"time"
@@ -14,12 +15,12 @@ import (
 
 // Public sentinel errors.
 var (
-	// ErrSkip is returned by FileHandler.AcceptFile to refuse a single
+	// ErrSkip is returned by RecvHandler.AcceptFile to refuse a single
 	// incoming file. The library answers FINFOACK(-1) ("already have it")
 	// on the wire; the batch continues with the next FINFO.
 	ErrSkip = errors.New("hydra: skip file")
 
-	// ErrDefer is returned by FileHandler.AcceptFile to refuse a file for
+	// ErrDefer is returned by RecvHandler.AcceptFile to refuse a file for
 	// now. The library answers FINFOACK(-2) ("try again in a later
 	// batch"); the batch continues.
 	ErrDefer = errors.New("hydra: defer file")
@@ -30,9 +31,10 @@ var (
 	// is touched, so the caller still owns the transport.
 	ErrTransportNotClosable = errors.New("hydra: transport is not closable")
 
-	// ErrFileTooLarge is delivered to FileHandler.FileCompleted when a
-	// FileOffer.Size exceeds SafeMaxOffset. The file is never sent on
-	// the wire — Hydra's offset fields are 32-bit signed.
+	// ErrFileTooLarge is delivered to FileCompleted (send side when a
+	// FileOffer.Size exceeds SafeMaxOffset, receive side when a peer
+	// announces such a size). The file never transfers — Hydra's offset
+	// fields are 32-bit signed.
 	ErrFileTooLarge = errors.New("hydra: file size exceeds 0x7FFFFFFE")
 
 	// ErrBrainDead is returned by Run when the brain-dead watchdog
@@ -52,9 +54,10 @@ var (
 	// retransmissions without an acknowledgement.
 	ErrMaxRetries = errors.New("hydra: retransmit limit exceeded")
 
-	// ErrHandlerContract is delivered to FileHandler.FileCompleted when
-	// AcceptFile returns (nil, _, nil) — a handler must return either a
-	// non-nil io.WriteCloser or a non-nil error.
+	// ErrHandlerContract is delivered to FileCompleted when
+	// RecvHandler.AcceptFile returns (nil, _, nil) — a handler must
+	// return either a non-nil io.WriteCloser or a non-nil error — or
+	// when a FileOffer carries a nil Reader.
 	ErrHandlerContract = errors.New("hydra: handler returned nil writer with nil error")
 
 	// ErrDevUnsupported is returned by Session.SendDevice when the peer
@@ -66,14 +69,15 @@ var (
 	// byte-safe (HydraCom's "Incompatible on this link" abort).
 	ErrIncompatible = errors.New("hydra: incompatible capabilities")
 
-	// ErrResumeOutOfRange is delivered to FileHandler.FileCompleted when
-	// AcceptFile returns a resume offset outside [0, announced size].
-	// The library answers FINFOACK(-2); the batch continues.
+	// ErrResumeOutOfRange is delivered to FileCompleted when
+	// RecvHandler.AcceptFile returns a resume offset outside
+	// [0, announced size]. The library answers FINFOACK(-2); the batch
+	// continues.
 	ErrResumeOutOfRange = errors.New("hydra: resume offset out of range")
 
-	// ErrSenderSkip is delivered to FileHandler.FileCompleted on the
-	// receiving side when the sender abandoned the file mid-transfer
-	// (EOF with a negative offset).
+	// ErrSenderSkip is delivered to RecvHandler.FileCompleted when the
+	// sender abandoned the file mid-transfer (EOF with a negative
+	// offset).
 	ErrSenderSkip = errors.New("hydra: sender skipped file")
 
 	// ErrRunActive is returned by Run when another Run on the same
@@ -99,6 +103,13 @@ type FileOffer struct {
 	Size    int64     // bytes; must be known (Hydra announces it)
 	ModTime time.Time // zero means "unknown" (0 on the wire)
 	Reader  io.Reader
+
+	// Close, if non-nil, is called exactly once per offered file: when
+	// the file's transfer completes (any outcome — sent, skipped,
+	// deferred, failed) or when the batch tears down with the file still
+	// in flight, whichever comes first. It releases whatever resource
+	// backs Reader; its error is not propagated.
+	Close func() error
 }
 
 // FileInfo describes an incoming file (parsed from FINFO).
@@ -114,14 +125,34 @@ type FileInfo struct {
 	FileTotal int
 }
 
-// FileHandler is the application callback interface. The same handler
-// serves both halves of the bidirectional session.
-type FileHandler interface {
+// SendHandler is the application callback interface for the transmit
+// half of the session. Hydra runs both directions concurrently, so the
+// send and receive callbacks are separate interfaces — an identically
+// named file can be in flight in both directions at once, and each
+// side's FileProgress/FileCompleted must be unambiguous. One object may
+// implement both interfaces and be passed as both arguments (the
+// per-direction method sets do not collide).
+type SendHandler interface {
 	// NextFile returns the next file to send, or nil when the local TX
 	// batch is finished. Called repeatedly until it returns nil — at
 	// that point the library emits the end-of-batch FINFO.
 	NextFile() *FileOffer
 
+	// FileProgress is called periodically during transmission with the
+	// current byte count. No cadence guarantee.
+	FileProgress(info FileInfo, bytesTransferred int64)
+
+	// FileCompleted is invoked exactly once per offered file when its
+	// transfer ends. err is nil on success; ErrSkip = the receiver
+	// answered "already have it" (delivered as far as the wire is
+	// concerned); ErrDefer = the receiver deferred the file to a later
+	// batch. The offer's Close hook has already run when this fires.
+	FileCompleted(info FileInfo, bytesTransferred int64, err error)
+}
+
+// RecvHandler is the application callback interface for the receive
+// half of the session.
+type RecvHandler interface {
 	// AcceptFile is invoked for every incoming file. The handler returns
 	//
 	//	(writer, offset, nil)      -- accept, resume at offset
@@ -134,17 +165,31 @@ type FileHandler interface {
 	// before using info.Name as a path component.
 	AcceptFile(info FileInfo) (io.WriteCloser, int64, error)
 
-	// FileProgress is called periodically during transfer (both
-	// directions) with the current byte count. No cadence guarantee.
+	// FileProgress is called periodically during reception with the
+	// current byte count. No cadence guarantee.
 	FileProgress(info FileInfo, bytesTransferred int64)
 
-	// FileCompleted is invoked exactly once per file when its transfer
-	// ends. err is nil on success. Sending-side outcomes: nil = data
-	// transferred and acknowledged; ErrSkip = the receiver answered
-	// "already have it" (delivered as far as the wire is concerned);
-	// ErrDefer = the receiver deferred the file to a later batch.
+	// FileCompleted is invoked exactly once per incoming file when its
+	// transfer ends. err is the write-time or protocol error, nil on
+	// success. The writer has been Closed before this fires.
 	FileCompleted(info FileInfo, bytesTransferred int64, err error)
 }
+
+// noSend is the nil-SendHandler stand-in: an immediately empty TX batch.
+type noSend struct{}
+
+func (noSend) NextFile() *FileOffer                { return nil }
+func (noSend) FileProgress(FileInfo, int64)        {}
+func (noSend) FileCompleted(FileInfo, int64, error) {}
+
+// noRecv is the nil-RecvHandler stand-in: every incoming file is
+// deferred with FINFOACK(-2), the non-destructive refusal — the peer
+// keeps its files queued rather than marking them delivered.
+type noRecv struct{}
+
+func (noRecv) AcceptFile(FileInfo) (io.WriteCloser, int64, error) { return nil, 0, ErrDefer }
+func (noRecv) FileProgress(FileInfo, int64)                       {}
+func (noRecv) FileCompleted(FileInfo, int64, error)               {}
 
 // DeviceHandler receives device-channel datagrams (SPEC §3.13). Optional:
 // pass nil to NewSession and incoming DEVDATA is acknowledged and dropped.
@@ -208,6 +253,13 @@ type Config struct {
 	// io.Closer; if neither is reachable, Run returns
 	// ErrTransportNotClosable at startup.
 	Closer io.Closer
+
+	// Logger, if non-nil, receives a Debug record per decoded protocol
+	// packet in both directions (type, payload length, offset where the
+	// packet carries one), so protocol frames can interleave with a
+	// transport-level byte trace. The HYDRA_TRACE=1 stderr trace remains
+	// available as a zero-config fallback.
+	Logger *slog.Logger
 
 	// idleOverride shortens the 20 s IDLE emission interval in tests.
 	idleOverride time.Duration

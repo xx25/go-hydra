@@ -78,8 +78,9 @@ func countFrames(t *testing.T, recorded []byte, opts uint32) (map[byte]int, map[
 func TestConformanceAutostartAndEndCounts(t *testing.T) {
 	connA, connB := net.Pipe()
 	tapA, tapB := newTap(connA, -1), newTap(connB, -1)
-	sa := NewSession(tapA, newTestHandler(nil), nil, testConfig(true))
-	sb := NewSession(tapB, newTestHandler(nil), nil, testConfig(false))
+	hA, hB := newTestHandler(nil), newTestHandler(nil)
+	sa := NewSession(tapA, hA, hA, nil, testConfig(true))
+	sb := NewSession(tapB, hB, hB, nil, testConfig(false))
 	defer sa.Close()
 	defer sb.Close()
 	if errA, errB := runBoth(t, sa, sb); errA != nil || errB != nil {
@@ -112,8 +113,8 @@ func TestConformanceRposRecoveryAndLongForm(t *testing.T) {
 	tapB := newTap(connB, -1)
 	hA := newTestHandler([]testFile{{"noisy.bin", data}})
 	hB := newTestHandler(nil)
-	sa := NewSession(tapA, hA, nil, testConfig(true))
-	sb := NewSession(tapB, hB, nil, testConfig(false))
+	sa := NewSession(tapA, hA, hA, nil, testConfig(true))
+	sb := NewSession(tapB, hB, hB, nil, testConfig(false))
 	defer sa.Close()
 	defer sb.Close()
 	if errA, errB := runBoth(t, sa, sb); errA != nil || errB != nil {
@@ -200,10 +201,10 @@ func (sp *scriptPeer) handshake(supported, desired string) {
 	sp.opts.Store(capC32) // both sides support C32 in these scripts
 }
 
-func scriptedPair(t *testing.T, h FileHandler, cfg *Config) (*Session, *scriptPeer, chan error) {
+func scriptedPair(t *testing.T, h *testHandler, cfg *Config) (*Session, *scriptPeer, chan error) {
 	t.Helper()
 	connA, connB := net.Pipe()
-	sess := NewSession(connA, h, nil, cfg)
+	sess := NewSession(connA, h, h, nil, cfg)
 	sp := newScriptPeer(t, connB)
 	errCh := make(chan error, 1)
 	go func() {
@@ -427,7 +428,8 @@ func TestConformanceTeardownOnError(t *testing.T) {
 // and must poison later Runs.
 func TestConformanceAbortBeforeRun(t *testing.T) {
 	connA, _ := net.Pipe()
-	sess := NewSession(connA, newTestHandler(nil), nil, testConfig(true))
+	h := newTestHandler(nil)
+	sess := NewSession(connA, h, h, nil, testConfig(true))
 	if err := sess.Abort(); err != nil {
 		t.Fatalf("Abort: %v", err)
 	}
@@ -439,7 +441,8 @@ func TestConformanceAbortBeforeRun(t *testing.T) {
 // Run after Close must not report a successful batch.
 func TestConformanceRunAfterClose(t *testing.T) {
 	connA, _ := net.Pipe()
-	sess := NewSession(connA, newTestHandler(nil), nil, testConfig(true))
+	h := newTestHandler(nil)
+	sess := NewSession(connA, h, h, nil, testConfig(true))
 	_ = sess.Close()
 	if err := sess.Run(context.Background()); !errors.Is(err, ErrSessionClosed) {
 		t.Fatalf("Run after Close = %v, want ErrSessionClosed", err)
@@ -452,7 +455,8 @@ func TestConformanceRunAfterClose(t *testing.T) {
 func TestConformanceStaleDevDataBetweenBatches(t *testing.T) {
 	dev := &recordingDev{}
 	connA, connB := net.Pipe()
-	sess := NewSession(connA, newTestHandler(nil), dev, testConfig(true))
+	h := newTestHandler(nil)
+	sess := NewSession(connA, h, h, dev, testConfig(true))
 	defer sess.Close()
 	sp := newScriptPeer(t, connB)
 	errCh := make(chan error, 1)
