@@ -513,6 +513,30 @@ func TestConformanceStaleDevDataBetweenBatches(t *testing.T) {
 	}
 }
 
+// A peer that hangs up during the END exchange — after every transfer
+// completed — ends the batch successfully: FSC-0072 counts END retry
+// exhaustion as success ("the transfers completed; the peer just
+// left"), and a transport error there is the same event observed
+// sooner. Multi-batch mailers hit this constantly: the peer's final
+// END responses race its hangup.
+func TestConformanceEndPhaseHangup(t *testing.T) {
+	sess, sp, errCh := scriptedPair(t, newTestHandler(nil), testConfig(true))
+	defer sess.Close()
+	sp.handshake("XON,TLN,CTL,HIC,HI8,BRK,C32,DEV,FPT", "")
+	fi := sp.expect(pktFINFO)
+	if !isFinfoEOB(fi.payload) {
+		t.Fatalf("expected EOB FINFO, got %d bytes", len(fi.payload))
+	}
+	sp.send(pktFINFOACK, marshalOffset(0))
+	sp.send(pktFINFO, finfoEOB)
+	sp.expect(pktFINFOACK)
+	sp.expect(pktEND) // the session is in its END exchange now
+	_ = sp.conn.Close()
+	if err := <-errCh; err != nil {
+		t.Fatalf("END-phase hangup must be a clean batch, got %v", err)
+	}
+}
+
 // A vital-flag mismatch must abort with ErrIncompatible: we desire CTL
 // but the peer's supported set lacks it.
 func TestConformanceIncompatible(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -222,6 +223,16 @@ func (s *Session) Run(ctx context.Context) error {
 
 	b := newBatch(s)
 	err := b.run(ctx)
+	if err != nil && b.endPhaseHangup(err) {
+		// The peer vanished during the END courtesy exchange, after
+		// both directions' transfers had fully completed. FSC-0072
+		// counts END retry exhaustion as success ("the transfers
+		// completed; the peer just left") — a transport error there is
+		// the same event observed sooner. The next Run on this
+		// session fails fast on the dead transport, which multi-batch
+		// callers already classify as the peer being done.
+		err = nil
+	}
 	if err != nil {
 		s.recordError(err)
 		s.triggerAbort()
@@ -350,7 +361,17 @@ func (s *Session) close() {
 
 func isTransportErr(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, io.ErrClosedPipe)
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET)
+}
+
+// endPhaseHangup reports whether a batch error is a peer hangup
+// arriving after all transfer work was done — the TX machine had
+// entered the END exchange, which the sync gate only permits once the
+// RX machine and the device queue are finished too. Only the END
+// courtesies remained, and those are best-effort by specification.
+func (b *batch) endPhaseHangup(err error) bool {
+	return b.txState >= htxEnd && b.rxState == hrxDone && isTransportErr(err)
 }
 
 // --- batch ------------------------------------------------------------------
