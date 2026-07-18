@@ -1,0 +1,24 @@
+# Local working / planning documents — keep out of the repo
+*.md
+!README.md
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Claude Code session config
+.claude/
