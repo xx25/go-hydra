@@ -50,11 +50,31 @@ type Session struct {
 	started     bool
 	writerReady atomic.Bool
 	runActive   atomic.Bool
+
+	// readerStarted/readerDone let Close join the reader goroutine.
+	// Close is the teardown barrier: callers (e.g. a transfer driver
+	// that un-blocks the reader by poking an expired read deadline
+	// through the transport's Close, then re-arms the deadline for
+	// whoever uses the conn next) need the reader to be GONE before
+	// they touch the transport again — otherwise the re-arm can land
+	// before the parked reader observes the poke, re-blocking it
+	// forever on a transport whose reads only fail via deadline.
+	readerStarted atomic.Bool
+	readerDone    chan struct{} // closed when readerLoop exits
 }
 
 // cancelGraceTimeout bounds how long teardown waits for the courtesy
 // cancel sequence to flush before closing the transport regardless.
 const cancelGraceTimeout = 250 * time.Millisecond
+
+// readerJoinTimeout bounds how long Close waits for the reader
+// goroutine to exit after the transport is closed. On a deadline-capable
+// transport the reader unparks within one poll tick (≤50 ms); the cap
+// only matters on a transport whose Close cannot unblock a read at all,
+// where waiting longer would wedge teardown for nothing (that case
+// keeps the pre-join behaviour: the reader parks until the session
+// owner really closes the conn).
+const readerJoinTimeout = time.Second
 
 type devRequest struct {
 	device  string
@@ -157,15 +177,16 @@ func NewSession(transport io.ReadWriter, send SendHandler, recv RecvHandler, dev
 		recv = noRecv{}
 	}
 	return &Session{
-		config:    cfg.defaults(),
-		send:      send,
-		recv:      recv,
-		dev:       dev,
-		transport: transport,
-		inbox:     newPktInbox(),
-		readErr:   make(chan error, 1),
-		devQ:      make(chan devRequest, 8),
-		abortCh:   make(chan struct{}),
+		config:     cfg.defaults(),
+		send:       send,
+		recv:       recv,
+		dev:        dev,
+		transport:  transport,
+		inbox:      newPktInbox(),
+		readErr:    make(chan error, 1),
+		devQ:       make(chan devRequest, 8),
+		abortCh:    make(chan struct{}),
+		readerDone: make(chan struct{}),
 	}
 }
 
@@ -206,7 +227,11 @@ func (s *Session) Run(ctx context.Context) error {
 		s.rxOpts.Store(capAssumed)
 		s.reader = newTransportReader(s.transport, &s.rxOpts)
 		s.writerReady.Store(true)
-		go s.readerLoop()
+		s.readerStarted.Store(true)
+		go func() {
+			defer close(s.readerDone)
+			s.readerLoop()
+		}()
 	}
 
 	// Fresh batch: negotiation state resets, the assumed RX options
@@ -283,10 +308,27 @@ func (s *Session) courtesyCancel() {
 // Close releases the transport. Call after the final batch. Safe to call
 // multiple times and alongside Abort. A Run attempted after Close
 // returns ErrSessionClosed.
+//
+// Close is the teardown BARRIER: it does not return until the reader
+// goroutine has exited (bounded by readerJoinTimeout). Callers may
+// therefore re-arm transport deadlines or reuse the conn immediately
+// after Close without racing a still-parked reader — the property
+// transfer drivers rely on when their transport "Close" is really a
+// deadline poke on a conn they must hand back usable.
 func (s *Session) Close() error {
 	s.recordError(ErrSessionClosed)
 	s.triggerAbort()
 	s.close()
+	if s.readerStarted.Load() {
+		select {
+		case <-s.readerDone:
+		case <-time.After(readerJoinTimeout):
+			// Transport whose Close cannot unblock a read (no deadline
+			// support, nothing actually closed): don't wedge teardown —
+			// the reader parks until the session owner closes the conn
+			// for real, exactly the pre-join behaviour.
+		}
+	}
 	return nil
 }
 
