@@ -307,6 +307,7 @@ func (b *batch) txDataAck(pkt packet) {
 	if err != nil || b.txWindow == 0 {
 		return
 	}
+	b.peerAcked = true
 	if int64(ack) > b.txLastAck {
 		b.txLastAck = int64(ack)
 	}

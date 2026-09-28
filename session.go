@@ -489,6 +489,7 @@ type batch struct {
 	txSyncID   uint32
 	blk        *blockSizer
 	txLastAck  int64
+	peerAcked  bool // the peer has sent at least one DATAACK this batch
 	hdxlink    bool
 	txOffer    *FileOffer
 	txReader   io.Reader
@@ -886,6 +887,18 @@ func (b *batch) txTimeout() error {
 			return err
 		}
 		b.txTimer = time.Now().Add(b.idle())
+		return nil
+	}
+	if b.txState == htxDataAck && !b.peerAcked {
+		// The window filled and not one DATAACK came back: the peer
+		// ignores windows (bforce answers ours with IDLE only). Stream
+		// without one, as against a peer that asked for none, instead of
+		// probing a block per retry until the retries run out.
+		if lg := b.cfg.Logger; lg != nil {
+			lg.Debug("hydra: peer sends no DATAACK, dropping the TX window", "window", b.txWindow)
+		}
+		b.txWindow = 0
+		b.txState = htxXdata
 		return nil
 	}
 	b.txRetries++
